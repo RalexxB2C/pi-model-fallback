@@ -24,6 +24,8 @@ Cooldown defaults when a rule omits `cooldownMs`:
 - `429` → 72 hours
 - `5xx` → 10 minutes
 
-`Retry-After` and `x-ratelimit-reset*` response headers override `cooldownMs` and those defaults.
+`Retry-After` and `x-ratelimit-reset*` response headers override those defaults when a rule omits `cooldownMs`; an explicit `cooldownMs` acts as a hard cap that server headers can only shorten, never stretch.
 
 If `autoRetry` is disabled, the failed request is not automatically replayed.
+
+When the active `pi-antigravity` account changes, persistent fallback state is cleared and Pi switches back to the original model by default (see `resetOnAccountChange`), so a fresh account with available quota is not pinned on the fallback model.

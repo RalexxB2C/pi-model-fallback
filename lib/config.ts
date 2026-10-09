@@ -26,6 +26,8 @@ export interface ModelFallbackConfig {
   enabled: boolean;
   /** Re-queue the failed user prompt after switching to the fallback model so the turn retries automatically. Defaults to true. */
   autoRetry?: boolean;
+  /** Clear persistent cooldown state and return to the original model when the active Antigravity account changes. Defaults to true. */
+  resetOnAccountChange?: boolean;
   rules: FallbackRule[];
 }
 
@@ -85,6 +87,7 @@ export function validateConfigShape(value: unknown): ModelFallbackConfig {
     version: CONFIG_VERSION,
     enabled,
     autoRetry: typeof value.autoRetry === "boolean" ? value.autoRetry : true,
+    resetOnAccountChange: typeof value.resetOnAccountChange === "boolean" ? value.resetOnAccountChange : true,
     rules: value.rules.map((ruleValue, index) => validateRule(ruleValue, index)),
   };
 }

@@ -17,6 +17,8 @@ export interface FallbackStateEntry {
 export interface FallbackState {
   version: 1;
   entries: FallbackStateEntry[];
+  /** Fingerprint of the active Antigravity account when it was last observed; entries from another account are reset by the extension. */
+  accountFingerprint?: string;
 }
 
 export function emptyState(): FallbackState {
@@ -49,20 +51,26 @@ export function findActiveStateEntry(state: FallbackState, source: ModelRef, now
 
 export function pruneExpiredState(state: FallbackState, now = new Date()): FallbackState {
   const nowMs = now.getTime();
-  return {
+  const pruned: FallbackState = {
     version: STATE_VERSION,
     entries: state.entries.filter((entry) => Date.parse(entry.until) > nowMs),
   };
+  if (state.accountFingerprint !== undefined) pruned.accountFingerprint = state.accountFingerprint;
+  return pruned;
 }
 
 export function validateStateShape(value: unknown): FallbackState {
   if (!isRecord(value)) throw new Error("State must be an object.");
   if (value.version !== STATE_VERSION) throw new Error(`Unsupported state version: ${String(value.version)}.`);
   if (!Array.isArray(value.entries)) throw new Error("entries must be an array.");
-  return {
+  const state: FallbackState = {
     version: STATE_VERSION,
     entries: value.entries.map((entry, index) => validateEntry(entry, index)),
   };
+  if (typeof value.accountFingerprint === "string" && value.accountFingerprint.trim() !== "") {
+    state.accountFingerprint = value.accountFingerprint.trim();
+  }
+  return state;
 }
 
 function validateEntry(value: unknown, index: number): FallbackStateEntry {

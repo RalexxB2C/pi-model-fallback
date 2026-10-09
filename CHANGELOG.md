@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- A rule with an explicit `cooldownMs` now acts as a hard cap: `Retry-After` and `x-ratelimit-reset*` response headers can only shorten the fallback window, never stretch it beyond the configured value. Headers still override the defaults when a rule omits `cooldownMs`.
+
+### Added
+
+- `resetOnAccountChange` (default `true`): persistent cooldown state now records a fingerprint of the active `pi-antigravity` account (sha-256 prefix of the account id, never the id itself). When the active account changes, stale cooldown entries from the previous account are cleared and Pi switches back to the original model, so a fresh account with available quota is not pinned on the fallback model. Set to `false` to keep the previous cross-account behavior.
+- Returning to the original model on the first successful response after the source model's cooldown entry has expired (previously the session stayed pinned on the fallback until manually switched back).
+
 ## [0.5.2] - 2026-10-07
 
 ### Changed

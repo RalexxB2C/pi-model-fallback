@@ -71,6 +71,7 @@ Default config shape:
   "version": 1,
   "enabled": true,
   "autoRetry": true,
+  "resetOnAccountChange": true,
   "rules": [
     {
       "name": "zai-to-deepseek-flash",
@@ -98,6 +99,7 @@ Top-level fields:
 
 - `enabled`: toggle the extension without deleting rules
 - `autoRetry`: when a fallback fires from a failed turn, automatically re-queue the failed user prompt so the turn retries on the fallback model (defaults to `true`; set to `false` to only switch models). The failed prompt is queued once per fallback transition, so a fallback chain may replay it more than once.
+- `resetOnAccountChange`: multi-account providers can switch the underlying account without a new session. When set (defaults to `true`), a detected account switch by `pi-antigravity` clears all persistent cooldown entries recorded for the previous account and switches back to the original model, so a fresh account with available quota is not pinned on the fallback model. Set to `false` to keep cooldown state across account switches.
 
 Rules use first-match order: the first rule whose provider/model and status match wins. Put specific `matchModels` rules before broad `matchProviders` rules when they should take priority. `model_fallback_config validate`, `save`, `read`, and `status` report warning-only diagnostics when a later rule or model entry is completely shadowed by an earlier rule; `/model-fallback:status` also includes a concise warning summary for the current config. Warning-bearing config remains valid and can still be saved.
 
@@ -108,7 +110,7 @@ When a rule does not set `cooldownMs`, the extension uses these defaults:
 - `429` → 72 hours
 - `5xx` → 10 minutes
 
-When the provider response includes `Retry-After` or `x-ratelimit-reset*` headers, those values override `cooldownMs` and the defaults for the persisted fallback window.
+When the provider response includes `Retry-After` or `x-ratelimit-reset*` headers, those values may only shorten the window: they override the defaults when a rule omits `cooldownMs`, but a rule with an explicit `cooldownMs` acts as a hard cap that server headers can never stretch.
 
 ## State and paths
 

@@ -16,6 +16,7 @@ import {
   type RuleWarning,
 } from "../lib/config.js";
 import { parseReasonFromErrorMessage, parseStatusFromErrorMessage } from "../lib/error-status.js";
+import { antigravityAccountsPath, readActiveAccountFingerprint } from "../lib/accounts.ts";
 import { emptyState, findActiveStateEntry, pruneExpiredState, readState, upsertStateEntry, validateStateShape, writeState, type FallbackState } from "../lib/state.js";
 import { isRecord } from "../lib/internal.ts";
 import { modelFallbackPaths, readConfig, writeConfig, type ModelFallbackPaths } from "../lib/storage.js";
@@ -24,6 +25,9 @@ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const STATUS_KEY = "model-fallback";
 const DEFAULT_429_COOLDOWN_MS = 72 * 60 * 60 * 1000;
 const DEFAULT_5XX_COOLDOWN_MS = 10 * 60 * 1000;
+// pi-antigravity keeps a multi-account store; a hard quota wall makes it silently switch
+// accounts mid-request, so cooldown state recorded for one account must never pin another.
+const ACCOUNT_CHANGE_PROVIDER = "antigravity";
 
 export default function modelFallback(pi: ExtensionAPI) {
   let paths: ModelFallbackPaths = modelFallbackPaths(getAgentDir());
@@ -181,10 +185,73 @@ export default function modelFallback(pi: ExtensionAPI) {
     return true;
   }
 
+  /**
+   * Track the active Antigravity account fingerprint in persistent state. When the
+   * fingerprint changes, stale cooldown entries from the previous account are cleared and
+   * the original model is restored: a freshly switched account may still have quota, so
+   * it must not stay pinned on the fallback model. Missing or malformed accounts store
+   * keeps detection inert.
+   */
+  async function refreshAccountState(ctx: ExtensionContext, provider: string): Promise<void> {
+    const loadedConfig = config ?? (await loadConfig(ctx));
+    if (!loadedConfig || loadedConfig.resetOnAccountChange === false) return;
+    if (provider !== ACCOUNT_CHANGE_PROVIDER) return;
+    const fingerprint = await readActiveAccountFingerprint(antigravityAccountsPath());
+    if (!fingerprint) return;
+    syncPaths(ctx);
+    const loadedState = state ?? (await loadState(ctx));
+    if (!loadedState) return;
+    const stored = loadedState.accountFingerprint;
+    if (stored === fingerprint) return;
+    const changed = stored !== undefined;
+    state = { version: 1, entries: changed ? [] : [...loadedState.entries], accountFingerprint: fingerprint };
+    await writeState(paths.state, state);
+    if (!changed) return;
+    ctx.ui.notify("Model fallback: Antigravity account changed; cooldown state reset.", "info");
+    await restoreOriginalModel(ctx, "account change");
+  }
+
+  /** Return to the remembered original model without replaying any prompt. */
+  async function restoreOriginalModel(ctx: ExtensionContext, reason: string): Promise<void> {
+    const target = originalModelKey;
+    activeFallbackKey = undefined;
+    originalModelKey = undefined;
+    lastFallbackReason = undefined;
+    visitedFallbackKeys = new Set();
+    updateStatus(ctx);
+    if (!target) return;
+    const [provider, ...modelParts] = target.split("/");
+    const model = ctx.modelRegistry.find(provider, modelParts.join("/"));
+    if (!model) {
+      ctx.ui.notify(`Model fallback original missing: ${target}`, "warning");
+      return;
+    }
+    const ok = await pi.setModel(model);
+    if (!ok) {
+      ctx.ui.notify(`Model fallback original auth unavailable: ${target}`, "warning");
+      return;
+    }
+    ctx.ui.notify(`Model fallback: returned to ${target} (${reason}).`, "info");
+  }
+
+  /** Restore the remembered original model once its cooldown entry has expired. */
+  async function restoreAfterCooldownExpiry(ctx: ExtensionContext): Promise<void> {
+    if (!activeFallbackKey || !originalModelKey) return;
+    syncPaths(ctx);
+    const loadedState = state ?? (await loadState(ctx));
+    if (!loadedState) return;
+    const [provider, ...modelParts] = originalModelKey.split("/");
+    const sourceRef = { provider, model: modelParts.join("/") };
+    const active = findActiveStateEntry(loadedState, sourceRef);
+    if (active && modelRefKey(active.fallback) === activeFallbackKey) return;
+    await restoreOriginalModel(ctx, `cooldown for ${originalModelKey} expired`);
+  }
+
   pi.on("agent_start", async (_event, ctx) => {
     await loadConfig(ctx);
     await loadState(ctx);
     visitedFallbackKeys = new Set();
+    if (ctx.model) await refreshAccountState(ctx, ctx.model.provider);
     await applyPersistentFallback(ctx);
     updateStatus(ctx);
   });
@@ -203,7 +270,11 @@ export default function modelFallback(pi: ExtensionAPI) {
     const current = ctx.model;
     const loaded = config ?? (await loadConfig(ctx));
     if (!current || !loaded) return;
-    if (event.status >= 200 && event.status < 300) return;
+    await refreshAccountState(ctx, current.provider);
+    if (event.status >= 200 && event.status < 300) {
+      await restoreAfterCooldownExpiry(ctx);
+      return;
+    }
 
     await persistFailure(modelToRef(current), event.status, event.headers, ctx);
   });
@@ -213,6 +284,7 @@ export default function modelFallback(pi: ExtensionAPI) {
     if (!isRecord(message) || message.role !== "assistant") return;
     const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
     if (!errorMessage) return;
+    if (ctx.model) await refreshAccountState(ctx, ctx.model.provider);
     const status = parseStatusFromErrorMessage(errorMessage);
     if (status === undefined) return;
     const reason = parseReasonFromErrorMessage(errorMessage);
@@ -446,13 +518,15 @@ function textResult(text: string, details?: Record<string, unknown>) {
 }
 
 function cooldownMsFor(ruleCooldownMs: number | undefined, status: number, headers: Record<string, string>): number {
-  const headerMs = cooldownMsFromHeaders(headers);
-  if (headerMs !== undefined) return headerMs;
-  if (ruleCooldownMs !== undefined) return ruleCooldownMs;
-  if (status === 429) return DEFAULT_429_COOLDOWN_MS;
-  if (status >= 500 && status <= 599) return DEFAULT_5XX_COOLDOWN_MS;
-  return DEFAULT_5XX_COOLDOWN_MS;
+  const baseline = cooldownMsFromHeaders(headers)
+    ?? ruleCooldownMs
+    ?? (status === 429 ? DEFAULT_429_COOLDOWN_MS : DEFAULT_5XX_COOLDOWN_MS);
+  // A configured rule cooldown is a hard cap: server retry/reset headers may shorten it
+  // but must never stretch the fallback period beyond what the rule allows.
+  return ruleCooldownMs !== undefined ? Math.min(baseline, ruleCooldownMs) : baseline;
 }
+
+export { cooldownMsFor };
 
 function cooldownMsFromHeaders(headers: Record<string, string>): number | undefined {
   const normalized = Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]));

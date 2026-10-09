@@ -36,3 +36,7 @@ Thumbs.db
 *.log
 .tmp/
 tmp/
+
+AGENTS.md
+.llm-wiki/
+graphify-out/
