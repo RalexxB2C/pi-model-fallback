@@ -1,4 +1,7 @@
+const RESPONSE_HEADERS_TIMEOUT_PATTERN = /\bno response headers within \d+ms\b/i;
+
 const REASON_TEXT_PATTERNS: Array<[RegExp, string]> = [
+  [RESPONSE_HEADERS_TIMEOUT_PATTERN, "response_headers_timeout"],
   [/exceeds\s+(?:this|the)\s+model'?s?\s+context\s+length/i, "context_length_exceeded"],
   [/context[\s_-]*length[\s_-]*exceeded/i, "context_length_exceeded"],
 ];
@@ -30,6 +33,8 @@ const EMPTY_PROVIDER_RESPONSE_PATTERNS: RegExp[] = [
 ];
 
 export function parseStatusFromErrorMessage(message: string): number | undefined {
+  // Transport header timeouts have no HTTP response; classify them for status-based rules.
+  if (RESPONSE_HEADERS_TIMEOUT_PATTERN.test(message)) return 504;
   for (const pattern of EMPTY_PROVIDER_RESPONSE_PATTERNS) {
     if (pattern.test(message)) {
       // Synthesize 502 so status-based fallback rules fire instead of the

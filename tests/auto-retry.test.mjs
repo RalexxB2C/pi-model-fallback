@@ -109,6 +109,57 @@ async function seedPersistent401(statePath) {
   );
 }
 
+const headerTimeoutRule = {
+  name: "response-headers-timeout",
+  matchModels: [SOURCE],
+  statuses: [504],
+  reasons: ["response_headers_timeout"],
+  cooldownMs: 300000,
+  fallback: FALLBACK,
+};
+
+test("header timeout switches models and queues the failed prompt once", async () => {
+  const project = await makeProject([headerTimeoutRule]);
+  const harness = createHarness(project.cwd, {
+    entries: [{ message: { role: "user", content: "continue the task" } }],
+  });
+  await harness.handlers.get("agent_start")(undefined, harness.ctx);
+  await harness.handlers.get("turn_end")({ message: {
+    role: "assistant", provider: SOURCE.provider, model: SOURCE.model,
+    errorMessage: "no response headers within 180000ms",
+  } }, harness.ctx);
+
+  assert.deepEqual(harness.calls.setModel, [{ provider: FALLBACK.provider, id: FALLBACK.model }]);
+  assert.deepEqual(harness.calls.sendUserMessage, [{ text: "continue the task", options: { deliverAs: "followUp" } }]);
+  const state = JSON.parse(await readFile(project.statePath, "utf8"));
+  assert.equal(state.entries[0].status, 504);
+  assert.equal(Date.parse(state.entries[0].until) - Date.parse(state.entries[0].createdAt), 300000);
+
+  await harness.handlers.get("turn_end")({ message: {
+    role: "assistant", provider: FALLBACK.provider, model: FALLBACK.model,
+    errorMessage: "no response headers within 180000ms",
+  } }, harness.ctx);
+  assert.equal(harness.calls.sendUserMessage.length, 1, "no matching rule for the failing fallback");
+});
+
+test("header timeout rule ignores cancellation, ordinary 504 and other models", async () => {
+  const project = await makeProject([headerTimeoutRule]);
+  const harness = createHarness(project.cwd);
+  await harness.handlers.get("agent_start")(undefined, harness.ctx);
+  await harness.handlers.get("after_provider_response")({ status: 504, headers: {} }, harness.ctx);
+  for (const errorMessage of ["Request was aborted", "Request timed out.", "HTTP 504 Gateway Timeout"]) {
+    await harness.handlers.get("turn_end")({ message: {
+      role: "assistant", provider: SOURCE.provider, model: SOURCE.model, errorMessage,
+    } }, harness.ctx);
+  }
+  await harness.handlers.get("turn_end")({ message: {
+    role: "assistant", provider: SOURCE.provider, model: "another-model",
+    errorMessage: "no response headers within 180000ms",
+  } }, harness.ctx);
+  assert.deepEqual(harness.calls.setModel, []);
+  assert.deepEqual(harness.calls.sendUserMessage, []);
+});
+
 const creditsErrorAssistantMessage = {
   role: "assistant",
   provider: SOURCE.provider,

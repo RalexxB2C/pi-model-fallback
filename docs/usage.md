@@ -19,6 +19,21 @@ Rule order is first-match: the first rule whose provider/model and status match 
 
 Rules can also match on failure reasons with `reasons`, for example `"reasons": ["context_length_exceeded"]` on a `400` rule so only context-overflow failures switch models while other `400`s stay errors. Reasons are parsed from quoted provider error codes (for example `"provider_error_code":"context_length_exceeded"`) or prose such as `exceeds this model's context length`. A rule never falls back to the failing model itself.
 
+Transport errors matching `no response headers within <duration>ms` are classified as synthetic status `504` with reason `response_headers_timeout`; no HTTP response was received. To route only this failure (not ordinary HTTP 504 responses or user cancellation), add a rule such as:
+
+```json
+{
+  "name": "gemini-header-timeout-to-luna",
+  "matchModels": [{ "provider": "antigravity", "model": "gemini-3.8-flash" }],
+  "statuses": [504],
+  "reasons": ["response_headers_timeout"],
+  "cooldownMs": 300000,
+  "fallback": { "provider": "openai-codex", "model": "gpt-6-luna" }
+}
+```
+
+The target model must be registered and authenticated in your installation. Keep existing rules (for example 429 routing) alongside this rule. Synthetic 504 also matches existing broad 504 rules; put the reason-specific rule first if they overlap. Automatic replay can repeat tool side effects from earlier in the failed turn; it is not an exactly-once execution guarantee.
+
 Cooldown defaults when a rule omits `cooldownMs`:
 
 - `429` → 72 hours

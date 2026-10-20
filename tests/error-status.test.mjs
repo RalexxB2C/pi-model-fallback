@@ -66,6 +66,25 @@ test("parseStatusFromErrorMessage synthesizes 502 for empty-provider responses",
   assert.equal(parseStatusFromErrorMessage("429 tokens remaining in context window"), undefined);
 });
 
+test("classifies response header timeouts without depending on the duration", () => {
+  for (const message of [
+    "no response headers within 180000ms",
+    "Error: no response headers within 90000ms",
+  ]) {
+    assert.equal(parseStatusFromErrorMessage(message), 504);
+    assert.equal(parseReasonFromErrorMessage(message), "response_headers_timeout");
+  }
+});
+
+test("does not classify cancellation or other timeouts as response header timeouts", () => {
+  for (const message of ["Request was aborted", "User cancelled the request", "Request timed out.", "no response headers within unknownms"]) {
+    assert.equal(parseStatusFromErrorMessage(message), undefined);
+    assert.equal(parseReasonFromErrorMessage(message), undefined);
+  }
+  assert.equal(parseStatusFromErrorMessage("HTTP 504 Gateway Timeout"), 504);
+  assert.equal(parseReasonFromErrorMessage("HTTP 504 Gateway Timeout"), undefined);
+});
+
 test("parseStatusFromErrorMessage ignores unrelated 3-digit numbers", () => {
   assert.equal(parseStatusFromErrorMessage("429 tokens remaining in context window"), undefined);
   assert.equal(parseStatusFromErrorMessage("processed 404 items before retry"), undefined);
