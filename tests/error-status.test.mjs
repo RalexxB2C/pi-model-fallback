@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
 
 const { parseReasonFromErrorMessage, parseStatusFromErrorMessage } = await import("../lib/error-status.ts");
 
@@ -64,6 +65,22 @@ test("parseStatusFromErrorMessage synthesizes 502 for empty-provider responses",
   assert.equal(parseStatusFromErrorMessage("Request was aborted"), undefined);
   // Prose containing neither the phrase nor a status stays unmatched.
   assert.equal(parseStatusFromErrorMessage("429 tokens remaining in context window"), undefined);
+});
+
+test("classifies Antigravity model unavailability separately from quota errors", async () => {
+  const message = await readFile(new URL("./fixtures/antigravity-model-unavailable.txt", import.meta.url), "utf8");
+  assert.equal(parseStatusFromErrorMessage(message), 503);
+  assert.equal(parseReasonFromErrorMessage(message), "model_unavailable");
+
+  for (const unrelated of [
+    "Resource has been exhausted (e.g. check quota).",
+    "This model is unavailable right now",
+    message.replace("Antigravity API error", "Other API error"),
+    message.replace("This model is unavailable right now", "Request was aborted"),
+  ]) {
+    assert.equal(parseStatusFromErrorMessage(unrelated), undefined);
+    assert.equal(parseReasonFromErrorMessage(unrelated), undefined);
+  }
 });
 
 test("classifies response header timeouts without depending on the duration", () => {

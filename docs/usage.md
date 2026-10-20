@@ -34,6 +34,24 @@ Transport errors matching `no response headers within <duration>ms` are classifi
 
 The target model must be registered and authenticated in your installation. Keep existing rules (for example 429 routing) alongside this rule. Synthetic 504 also matches existing broad 504 rules; put the reason-specific rule first if they overlap. Automatic replay can repeat tool side effects from earlier in the failed turn; it is not an exactly-once execution guarantee.
 
+Antigravity errors matching `Antigravity API error (request-failed, ...): This model is unavailable right now` are classified as synthetic status `503` with reason `model_unavailable`. This does not imply account quota exhaustion. To route this failure to Luna for either the base or high model ID, add:
+
+```json
+{
+  "name": "antigravity-model-unavailable-to-luna",
+  "matchModels": [
+    { "provider": "antigravity", "model": "gemini-3.8-flash" },
+    { "provider": "antigravity", "model": "gemini-3.8-flash-high" }
+  ],
+  "statuses": [503],
+  "reasons": ["model_unavailable"],
+  "cooldownMs": 300000,
+  "fallback": { "provider": "openai-codex", "model": "gpt-6-luna" }
+}
+```
+
+Place this rule before overlapping broad 503 rules. Generic quota messages and ordinary HTTP 503 responses do not match its reason. Matching uses the failed assistant message's model ID, not the `runtimeModel` field inside the error text. This rule does not fix the provider's runtime model selection.
+
 Cooldown defaults when a rule omits `cooldownMs`:
 
 - `429` → 72 hours

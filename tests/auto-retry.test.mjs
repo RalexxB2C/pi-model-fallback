@@ -160,6 +160,40 @@ test("header timeout rule ignores cancellation, ordinary 504 and other models", 
   assert.deepEqual(harness.calls.sendUserMessage, []);
 });
 
+test("Antigravity model unavailability retries on Luna for base and high model IDs", async () => {
+  const errorMessage = await readFile(new URL("./fixtures/antigravity-model-unavailable.txt", import.meta.url), "utf8");
+  const fallback = { provider: "openai-codex", model: "gpt-6-luna" };
+  const sources = ["gemini-3.8-flash", "gemini-3.8-flash-high"].map(model => ({ provider: "antigravity", model }));
+  for (const source of sources) {
+    const project = await makeProject([{
+      name: "antigravity-model-unavailable-to-luna",
+      matchModels: sources,
+      statuses: [503],
+      reasons: ["model_unavailable"],
+      cooldownMs: 300000,
+      fallback,
+    }]);
+    const harness = createHarness(project.cwd, {
+      entries: [{ message: { role: "user", content: "continue the task" } }],
+    });
+    harness.ctx.model = { provider: source.provider, id: source.model };
+    await harness.handlers.get("agent_start")(undefined, harness.ctx);
+    for (const ignored of ["HTTP 503 Service unavailable", "Resource has been exhausted (e.g. check quota).", "Request was aborted"]) {
+      await harness.handlers.get("turn_end")({ message: { role: "assistant", ...source, errorMessage: ignored } }, harness.ctx);
+    }
+    assert.equal(harness.calls.setModel.length, 0);
+    await harness.handlers.get("turn_end")({ message: { role: "assistant", ...source, errorMessage } }, harness.ctx);
+    assert.deepEqual(harness.calls.setModel, [{ provider: fallback.provider, id: fallback.model }]);
+    assert.deepEqual(harness.calls.sendUserMessage, [{ text: "continue the task", options: { deliverAs: "followUp" } }]);
+    const state = JSON.parse(await readFile(project.statePath, "utf8"));
+    assert.deepEqual(state.entries[0].source, source);
+    assert.equal(state.entries[0].status, 503);
+    assert.equal(Date.parse(state.entries[0].until) - Date.parse(state.entries[0].createdAt), 300000);
+    await harness.handlers.get("turn_end")({ message: { role: "assistant", ...fallback, errorMessage } }, harness.ctx);
+    assert.equal(harness.calls.sendUserMessage.length, 1, "no matching rule for Luna");
+  }
+});
+
 const creditsErrorAssistantMessage = {
   role: "assistant",
   provider: SOURCE.provider,
