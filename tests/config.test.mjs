@@ -207,3 +207,81 @@ test("config validation accepts reasons and rejects invalid entries", () => {
     /must not be empty/,
   );
 });
+
+test("config validation accepts timeoutFallback and rejects invalid shapes", () => {
+  const valid = validateConfigShape({
+    version: 1,
+    enabled: true,
+    rules: [{ matchProviders: ["zai"], fallback }],
+    timeoutFallback: {
+      enabled: true,
+      fallback: { provider: "openai-codex", model: "gpt-6-luna" },
+      cooldownMs: 60000,
+    },
+  });
+  assert.equal(valid.timeoutFallback?.enabled, true);
+  assert.deepEqual(valid.timeoutFallback?.fallback, { provider: "openai-codex", model: "gpt-6-luna" });
+  assert.equal(valid.timeoutFallback?.cooldownMs, 60000);
+
+  assert.throws(
+    () => validateConfigShape({
+      version: 1,
+      enabled: true,
+      rules: [{ matchProviders: ["zai"], fallback }],
+      timeoutFallback: { enabled: true, fallback: "not-an-object" },
+    }),
+    /fallback/,
+  );
+
+  assert.throws(
+    () => validateConfigShape({
+      version: 1,
+      enabled: true,
+      rules: [{ matchProviders: ["zai"], fallback }],
+      timeoutFallback: { enabled: "yes", fallback: { provider: "a", model: "b" } },
+    }),
+    /boolean/,
+  );
+});
+
+test("findFallback respects timeoutFallback when enabled and disabled", () => {
+  const baseConfig = {
+    version: 1,
+    enabled: true,
+    rules: [
+      {
+        name: "general-timeout",
+        matchProviders: ["google"],
+        reasons: ["response_headers_timeout"],
+        fallback: { provider: "anthropic", model: "claude-3-5-sonnet" },
+      },
+    ],
+  };
+
+  // Enabled timeoutFallback overrides general rule
+  const enabledConfig = {
+    ...baseConfig,
+    timeoutFallback: {
+      enabled: true,
+      fallback: { provider: "openai-codex", model: "gpt-6-luna" },
+    },
+  };
+  const res1 = findFallback(enabledConfig, { provider: "google", id: "gemini-2.5-pro" }, 504, "response_headers_timeout");
+  assert.deepEqual(res1?.fallback, { provider: "openai-codex", model: "gpt-6-luna" });
+
+  // Disabled timeoutFallback suppresses fallback even if a rule matches
+  const disabledConfig = {
+    ...baseConfig,
+    timeoutFallback: {
+      enabled: false,
+      fallback: { provider: "openai-codex", model: "gpt-6-luna" },
+    },
+  };
+  const res2 = findFallback(disabledConfig, { provider: "google", id: "gemini-2.5-pro" }, 504, "response_headers_timeout");
+  assert.equal(res2, undefined);
+
+  // findFallback does not route to self if already on timeoutFallback model
+  const res3 = findFallback(enabledConfig, { provider: "openai-codex", id: "gpt-6-luna" }, 504, "response_headers_timeout");
+  assert.equal(res3, undefined);
+});
+

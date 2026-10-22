@@ -21,6 +21,12 @@ export interface FallbackRule {
   fallback: ModelRef;
 }
 
+export interface TimeoutFallbackConfig {
+  enabled?: boolean;
+  fallback: ModelRef;
+  cooldownMs?: number;
+}
+
 export interface ModelFallbackConfig {
   version: 1;
   enabled: boolean;
@@ -28,6 +34,8 @@ export interface ModelFallbackConfig {
   autoRetry?: boolean;
   /** Clear persistent cooldown state and return to the original model when the active Antigravity account changes. Defaults to true. */
   resetOnAccountChange?: boolean;
+  /** Dedicated fallback configuration for response header timeout errors. */
+  timeoutFallback?: TimeoutFallbackConfig;
   rules: FallbackRule[];
 }
 
@@ -83,11 +91,26 @@ export function validateConfigShape(value: unknown): ModelFallbackConfig {
   if (!Array.isArray(value.rules)) throw new Error("rules must be an array.");
   if (value.rules.length === 0) throw new Error("rules must include at least one fallback rule.");
 
+  let timeoutFallback: TimeoutFallbackConfig | undefined;
+  if (value.timeoutFallback !== undefined) {
+    if (!isRecord(value.timeoutFallback)) throw new Error("timeoutFallback must be an object.");
+    const fallback = readModelRef(value.timeoutFallback.fallback, "timeoutFallback.fallback");
+    if (value.timeoutFallback.enabled !== undefined && typeof value.timeoutFallback.enabled !== "boolean") {
+      throw new Error("timeoutFallback.enabled must be a boolean.");
+    }
+    const timeoutEnabled = typeof value.timeoutFallback.enabled === "boolean" ? value.timeoutFallback.enabled : true;
+    const cooldownMs = value.timeoutFallback.cooldownMs !== undefined
+      ? readPositiveInteger(value.timeoutFallback.cooldownMs, "timeoutFallback.cooldownMs")
+      : undefined;
+    timeoutFallback = { enabled: timeoutEnabled, fallback, ...(cooldownMs !== undefined ? { cooldownMs } : {}) };
+  }
+
   return {
     version: CONFIG_VERSION,
     enabled,
     autoRetry: typeof value.autoRetry === "boolean" ? value.autoRetry : true,
     resetOnAccountChange: typeof value.resetOnAccountChange === "boolean" ? value.resetOnAccountChange : true,
+    ...(timeoutFallback !== undefined ? { timeoutFallback } : {}),
     rules: value.rules.map((ruleValue, index) => validateRule(ruleValue, index)),
   };
 }
@@ -99,6 +122,26 @@ export function findFallback(
   reason?: string,
 ): MatchedFallback | undefined {
   if (!config.enabled) return undefined;
+
+  if (reason === "response_headers_timeout") {
+    if (config.timeoutFallback) {
+      if (config.timeoutFallback.enabled === false) return undefined;
+      if (modelKey(model) !== modelRefKey(config.timeoutFallback.fallback)) {
+        return {
+          rule: {
+            name: "timeout-fallback",
+            statuses: [504],
+            reasons: ["response_headers_timeout"],
+            cooldownMs: config.timeoutFallback.cooldownMs ?? 300000,
+            fallback: config.timeoutFallback.fallback,
+          },
+          fallback: config.timeoutFallback.fallback,
+        };
+      }
+      return undefined;
+    }
+  }
+
   for (const rule of config.rules) {
     if (!statusesFor(rule).has(status)) continue;
     if (!modelMatches(rule, model)) continue;

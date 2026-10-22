@@ -55,10 +55,22 @@ pi -e npm:pi-model-fallback
 ```text
 /model-fallback:status
 /model-fallback:reset
+/model-fallback:on
+/model-fallback:off
+/model-fallback:timeout [<provider/model> | on | off]
+/model-fallback:timeout-on
+/model-fallback:timeout-off
 ```
 
-- `status`: shows whether fallback is enabled, active persistent entries, and current paths
+- `status`: shows whether fallback is enabled, timeout fallback configuration, active persistent entries, and current paths
 - `reset`: clears persistent fallback state and switches back to the remembered original model when possible
+- `on` / `off`: enables or disables model fallback globally (aliases: `enable`, `disable`)
+- `timeout`: configures or toggles fallback for header timeout errors (`response_headers_timeout`):
+  - Without arguments: opens an interactive picker of available models in the UI
+  - `<provider/model>`: sets the designated timeout fallback model (e.g. `/model-fallback:timeout openai-codex/gpt-6-luna`)
+  - `on`: enables timeout fallback using the configured model
+  - `off`: disables timeout fallback
+- `timeout-on` / `timeout-off`: direct shortcut commands to enable or disable timeout fallback
 
 ## Configuration
 
@@ -100,6 +112,7 @@ Top-level fields:
 - `enabled`: toggle the extension without deleting rules
 - `autoRetry`: when a fallback fires from a failed turn, automatically re-queue the failed user prompt so the turn retries on the fallback model (defaults to `true`; set to `false` to only switch models). The failed prompt is queued once per fallback transition, so a fallback chain may replay it more than once.
 - `resetOnAccountChange`: multi-account providers can switch the underlying account without a new session. When set (defaults to `true`), a detected account switch by `pi-antigravity` clears all persistent cooldown entries recorded for the previous account and switches back to the original model, so a fresh account with available quota is not pinned on the fallback model. Set to `false` to keep cooldown state across account switches.
+- `timeoutFallback`: optional dedicated fallback target for header timeout errors (`response_headers_timeout`). Contains `enabled` (boolean, defaults to `true`), `fallback` (`{ provider, model }`), and optional `cooldownMs`. When enabled, header timeouts route immediately to this model without needing hardcoded rules. When disabled (`enabled: false`), fallback on header timeout is suppressed.
 
 Rules use first-match order: the first rule whose provider/model and status match wins. Put specific `matchModels` rules before broad `matchProviders` rules when they should take priority. `model_fallback_config validate`, `save`, `read`, and `status` report warning-only diagnostics when a later rule or model entry is completely shadowed by an earlier rule; `/model-fallback:status` also includes a concise warning summary for the current config. Warning-bearing config remains valid and can still be saved.
 

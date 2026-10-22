@@ -2,7 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   analyzeRuleWarnings,
@@ -37,6 +38,7 @@ export default function modelFallback(pi: ExtensionAPI) {
   let originalModelKey: string | undefined;
   let activeFallbackKey: string | undefined;
   let lastFallbackReason: string | undefined;
+  let lastContext: ExtensionContext | undefined;
   // Models already fallen back to during this run (plus the original). A cascade may only
   // target a model never visited, which makes chains (free → kimi → glm) safe while
   // preventing A→B→A ping-pong with circular rules.
@@ -248,6 +250,7 @@ export default function modelFallback(pi: ExtensionAPI) {
   }
 
   pi.on("agent_start", async (_event, ctx) => {
+    lastContext = ctx;
     await loadConfig(ctx);
     await loadState(ctx);
     visitedFallbackKeys = new Set();
@@ -301,12 +304,180 @@ export default function modelFallback(pi: ExtensionAPI) {
     await pi.sendUserMessage(prompt, { deliverAs: "followUp" });
   });
 
+  async function setEnabled(nextEnabled: boolean, cmdCtx: ExtensionCommandContext): Promise<void> {
+    lastContext = cmdCtx;
+    const loaded = config ?? (await loadConfig(cmdCtx)) ?? defaultConfig();
+    loaded.enabled = nextEnabled;
+    syncPaths(cmdCtx);
+    await writeConfig(paths.config, loaded);
+    config = loaded;
+    cmdCtx.ui.notify(`Model fallback ${nextEnabled ? "enabled" : "disabled"}.`, "info");
+  }
+
   pi.registerCommand("model-fallback:status", {
     description: "Show model fallback status",
     handler: async (_args, ctx) => {
+      lastContext = ctx;
       const loaded = config ?? (await loadConfig(ctx)) ?? defaultConfig();
       const loadedState = state ?? (await loadState(ctx)) ?? { version: 1 as const, entries: [] };
       ctx.ui.notify(formatStatus(loaded, loadedState, paths.config, paths.state, analyzeRuleWarnings(loaded), activeFallbackKey, originalModelKey, lastFallbackReason), "info");
+    },
+  });
+
+  pi.registerCommand("model-fallback:on", {
+    description: "Enable model fallback globally",
+    handler: (_args, ctx) => setEnabled(true, ctx),
+  });
+
+  pi.registerCommand("model-fallback:off", {
+    description: "Disable model fallback globally",
+    handler: (_args, ctx) => setEnabled(false, ctx),
+  });
+
+  pi.registerCommand("model-fallback:enable", {
+    description: "Enable model fallback globally (alias for :on)",
+    handler: (_args, ctx) => setEnabled(true, ctx),
+  });
+
+  pi.registerCommand("model-fallback:disable", {
+    description: "Disable model fallback globally (alias for :off)",
+    handler: (_args, ctx) => setEnabled(false, ctx),
+  });
+
+  async function applyTimeoutFallback(target: ModelRef, targetCtx: ExtensionContext, loaded: ModelFallbackConfig): Promise<void> {
+    loaded.timeoutFallback = {
+      enabled: true,
+      fallback: target,
+      cooldownMs: loaded.timeoutFallback?.cooldownMs ?? 300000,
+    };
+    syncPaths(targetCtx);
+    await writeConfig(paths.config, loaded);
+    config = loaded;
+    targetCtx.ui.notify(`Model fallback for timeouts set to ${modelRefKey(target)} (enabled).`, "info");
+  }
+
+  async function handleTimeoutCommand(args: string, cmdCtx: ExtensionCommandContext): Promise<void> {
+    const loaded = config ?? (await loadConfig(cmdCtx)) ?? defaultConfig();
+    const trimmed = args.trim();
+
+    if (trimmed === "on") {
+      if (!loaded.timeoutFallback) {
+        const existingRule = loaded.rules.find((r) => r.reasons?.includes("response_headers_timeout"));
+        if (existingRule) {
+          await applyTimeoutFallback(existingRule.fallback, cmdCtx, loaded);
+        } else {
+          if (cmdCtx.hasUI && typeof cmdCtx.ui.select === "function") {
+            return await promptAndSetTimeoutModel(cmdCtx, loaded);
+          }
+          cmdCtx.ui.notify("No fallback model configured for timeouts. Usage: /model-fallback:timeout <provider/model>", "warning");
+        }
+      } else {
+        loaded.timeoutFallback.enabled = true;
+        syncPaths(cmdCtx);
+        await writeConfig(paths.config, loaded);
+        config = loaded;
+        cmdCtx.ui.notify(`Model fallback for timeouts enabled (${modelRefKey(loaded.timeoutFallback.fallback)}).`, "info");
+      }
+      return;
+    }
+
+    if (trimmed === "off") {
+      const existingFallback = loaded.timeoutFallback?.fallback
+        ?? loaded.rules.find((r) => r.reasons?.includes("response_headers_timeout"))?.fallback
+        ?? loaded.rules[0]?.fallback;
+      if (!existingFallback) {
+        cmdCtx.ui.notify("No fallback rule configured to disable.", "warning");
+        return;
+      }
+      loaded.timeoutFallback = {
+        enabled: false,
+        fallback: existingFallback,
+        cooldownMs: loaded.timeoutFallback?.cooldownMs ?? 300000,
+      };
+      syncPaths(cmdCtx);
+      await writeConfig(paths.config, loaded);
+      config = loaded;
+      cmdCtx.ui.notify("Model fallback for timeouts disabled.", "info");
+      return;
+    }
+
+    if (trimmed.length > 0) {
+      const parsed = parseModelInput(trimmed);
+      if (!parsed) {
+        cmdCtx.ui.notify(`Invalid model format: "${trimmed}". Expected "provider/model" (e.g. "openai-codex/gpt-6-luna").`, "warning");
+        return;
+      }
+      const found = cmdCtx.modelRegistry.find(parsed.provider, parsed.model);
+      if (!found) {
+        cmdCtx.ui.notify(`Model not found in registry: ${modelRefKey(parsed)}. Check available models.`, "warning");
+        return;
+      }
+      await applyTimeoutFallback(parsed, cmdCtx, loaded);
+      return;
+    }
+
+    if (cmdCtx.hasUI && typeof cmdCtx.ui.select === "function") {
+      return await promptAndSetTimeoutModel(cmdCtx, loaded);
+    }
+    cmdCtx.ui.notify(`Timeout fallback: ${formatTimeoutStatus(loaded)}. Usage: /model-fallback:timeout <provider/model> | on | off`, "info");
+  }
+
+  async function promptAndSetTimeoutModel(dialogCtx: ExtensionContext, loaded: ModelFallbackConfig): Promise<void> {
+    const available = getAvailableModels(dialogCtx);
+    if (available.length === 0) {
+      dialogCtx.ui.notify("No available models found in registry. Specify model manually: /model-fallback:timeout <provider/model>", "warning");
+      return;
+    }
+    const currentKey = loaded.timeoutFallback ? modelRefKey(loaded.timeoutFallback.fallback) : undefined;
+    const options = available.map((m) => {
+      const key = `${m.provider}/${m.id}`;
+      return key === currentKey ? `${key} (current)` : key;
+    });
+    const selected = await dialogCtx.ui.select("Select fallback model for timeout errors:", options);
+    if (!selected) return;
+    const cleanKey = selected.replace(/\s+\(current\)$/, "").trim();
+    const parsed = parseModelInput(cleanKey);
+    if (!parsed) return;
+    await applyTimeoutFallback(parsed, dialogCtx, loaded);
+  }
+
+  pi.registerCommand("model-fallback:timeout", {
+    description: "Configure or toggle fallback for timeout errors",
+    getArgumentCompletions: (argumentPrefix: string, cmdCtx?: ExtensionCommandContext) => {
+      const prefix = argumentPrefix.toLowerCase().trim();
+      const items: AutocompleteItem[] = [
+        { value: "on", label: "on", description: "Enable timeout fallback" },
+        { value: "off", label: "off", description: "Disable timeout fallback" },
+      ];
+      const activeCtx = cmdCtx ?? lastContext;
+      if (activeCtx) {
+        const models = getAvailableModels(activeCtx);
+        for (const m of models) {
+          const key = `${m.provider}/${m.id}`;
+          items.push({ value: key, label: key, description: `Set timeout fallback to ${key}` });
+        }
+      }
+      return items.filter((item) => item.value.toLowerCase().startsWith(prefix));
+    },
+    handler: async (args, ctx) => {
+      lastContext = ctx;
+      await handleTimeoutCommand(args, ctx);
+    },
+  });
+
+  pi.registerCommand("model-fallback:timeout-on", {
+    description: "Enable fallback for timeout errors",
+    handler: async (_args, ctx) => {
+      lastContext = ctx;
+      await handleTimeoutCommand("on", ctx);
+    },
+  });
+
+  pi.registerCommand("model-fallback:timeout-off", {
+    description: "Disable fallback for timeout errors",
+    handler: async (_args, ctx) => {
+      lastContext = ctx;
+      await handleTimeoutCommand("off", ctx);
     },
   });
 
@@ -434,10 +605,58 @@ function packageEntryMatchesThisPackage(entry: unknown, settingsDir: string): bo
 }
 
 function validateRegisteredModels(ctx: ExtensionContext, nextConfig: ModelFallbackConfig): void {
+  if (nextConfig.timeoutFallback) {
+    const fallback = ctx.modelRegistry.find(nextConfig.timeoutFallback.fallback.provider, nextConfig.timeoutFallback.fallback.model);
+    if (!fallback) throw new Error(`Unknown fallback model: ${modelRefKey(nextConfig.timeoutFallback.fallback)}`);
+  }
   for (const rule of nextConfig.rules) {
     const fallback = ctx.modelRegistry.find(rule.fallback.provider, rule.fallback.model);
     if (!fallback) throw new Error(`Unknown fallback model: ${modelRefKey(rule.fallback)}`);
   }
+}
+
+function parseModelInput(input: string): ModelRef | undefined {
+  const trimmed = input.trim();
+  const slashIdx = trimmed.indexOf("/");
+  if (slashIdx > 0 && slashIdx < trimmed.length - 1) {
+    const provider = trimmed.slice(0, slashIdx).trim();
+    const model = trimmed.slice(slashIdx + 1).trim();
+    if (provider && model) return { provider, model };
+  }
+  const parts = trimmed.split(/\s+/);
+  if (parts.length === 2 && parts[0] && parts[1]) {
+    return { provider: parts[0], model: parts[1] };
+  }
+  return undefined;
+}
+
+function getAvailableModels(ctx: ExtensionContext): Array<{ provider: string; id: string }> {
+  try {
+    const registry = ctx.modelRegistry as unknown as Record<string, unknown> | undefined;
+    if (registry && typeof registry.getAvailable === "function") {
+      const models = (registry.getAvailable as () => unknown)();
+      if (Array.isArray(models) && models.length > 0) return models as Array<{ provider: string; id: string }>;
+    }
+    if (registry && typeof registry.getAll === "function") {
+      const models = (registry.getAll as () => unknown)();
+      if (Array.isArray(models) && models.length > 0) return models as Array<{ provider: string; id: string }>;
+    }
+  } catch {
+    // Ignore registry errors
+  }
+  return [];
+}
+
+function formatTimeoutStatus(config: ModelFallbackConfig): string {
+  if (config.timeoutFallback) {
+    const stateStr = config.timeoutFallback.enabled !== false ? "enabled" : "disabled";
+    return `${stateStr} -> ${modelRefKey(config.timeoutFallback.fallback)}`;
+  }
+  const rule = config.rules.find((r) => r.reasons?.includes("response_headers_timeout"));
+  if (rule) {
+    return `enabled via rule "${rule.name ?? "unnamed"}" -> ${modelRefKey(rule.fallback)}`;
+  }
+  return "not configured";
 }
 
 function formatStatus(
@@ -452,6 +671,7 @@ function formatStatus(
 ): string {
   return [
     `Model fallback: ${config.enabled ? "enabled" : "disabled"}`,
+    `Timeout fallback: ${formatTimeoutStatus(config)}`,
     `Auto retry: ${autoRetryEnabled(config) ? "enabled" : "disabled"}`,
     `Config: ${configPath}`,
     `State: ${statePath}`,
@@ -468,6 +688,7 @@ function formatStatus(
 function summarizeConfig(config: ModelFallbackConfig, warnings: RuleWarning[]): string {
   return [
     `enabled: ${config.enabled}`,
+    `timeoutFallback: ${formatTimeoutStatus(config)}`,
     `autoRetry: ${autoRetryEnabled(config)}`,
     ...config.rules.map((rule) => `${rule.name ?? "rule"}: ${rule.matchProviders?.join(",") ?? "models"} -> ${modelRefKey(rule.fallback)}`),
     `warnings: ${warningSummary(warnings)}`,
